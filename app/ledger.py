@@ -1,4 +1,4 @@
-"""台账核心逻辑：CSV 解析、整批校验、入账、核对包汇总。
+"""台账核心逻辑：CSV 解析、整批校验、入账、核对包汇总、箱数汇总构建。
 
 业务规则
 --------
@@ -9,10 +9,27 @@
 5. 每个仓次收发必须平衡：入库 + 转入 = 转出 + 交货 + 余箱。
    有差额则指出仓次，整批退回（不入账）。
 6. 批次整体去重（内容哈希），仓次名全局唯一。
+
+箱数汇总
+--------
+台账变厚后，核对包页不再每次扫描明细，而是读 crate_summary / orchard_summary 两张
+汇总表。首次汇总由库管在核对包页发起，后台分块构建（summary_state 状态机）：
+
+- off      未构建：列表与下载按原账（deliveries/sessions 明细）出数。
+- building 构建中：仍按原账出数；构建线程每块一个短事务，推进 high_water_mark 并
+           上报心跳。进程中断后状态停留在 building，凭心跳超时由重试接管，已汇总
+           进度随事务保留，不会重复计数。
+- active   已启用：列表与下载只查汇总表；此后每批入账在同一事务内把箱数增量并入
+           汇总表，入账失败则增量随批次一起回滚。
+
+恰好计一次：批次是否计入汇总由 upload id 与 high_water_mark 决定（构建期），或由
+入账事务自己并入（启用后）。入账事务与构建事务都持有 SQLite 写锁，状态读取与增量
+写入在同一事务内完成，因此扫描期间入账的批次也不会漏计或重计。
 """
 import csv
 import hashlib
 import io
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -254,7 +271,11 @@ def batch_hash(inbound_bytes, transfer_bytes, delivery_bytes):
 
 
 def persist_batch(conn, digest, batch, session_orchard):
-    """单事务入账；批次哈希冲突（重复上传）抛 BatchRejected。"""
+    """单事务入账；批次哈希冲突（重复上传）抛 BatchRejected。
+
+    汇总已启用（active）时，本批的箱数增量在同一事务内并入汇总表：
+    批次与增量一起提交，入账失败则一起撤回。
+    """
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
         with conn:
@@ -280,9 +301,174 @@ def persist_batch(conn, digest, batch, session_orchard):
                 "INSERT INTO sessions (name, orchard) VALUES (?, ?)",
                 [(s, o) for s, o in sorted(session_orchard.items()) if o is not None],
             )
+            # 状态读取必须在写事务内：与构建线程的收尾事务互斥，保证每批恰好计一次
+            if _summary_status_value(conn) == SUMMARY_ACTIVE:
+                apply_batch_to_summary(conn, batch, session_orchard)
     except Exception as exc:
         if "UNIQUE" in str(exc) and "batch_hash" in str(exc):
             raise BatchRejected(["该批次已上传并入账，请勿重复提交"]) from exc
+        raise
+
+
+# ---------------------------------------------------------------- 箱数汇总
+
+SUMMARY_OFF = "off"
+SUMMARY_BUILDING = "building"
+SUMMARY_ACTIVE = "active"
+
+
+def _summary_status_value(conn):
+    row = conn.execute("SELECT status FROM summary_state WHERE id = 1").fetchone()
+    return row["status"] if row else SUMMARY_OFF
+
+
+def summary_status(conn):
+    """汇总构建状态（含进度），供核对包页展示。"""
+    row = conn.execute(
+        "SELECT status, high_water_mark, heartbeat_at, started_at, finished_at"
+        " FROM summary_state WHERE id = 1"
+    ).fetchone()
+    status = dict(row) if row else {"status": SUMMARY_OFF, "high_water_mark": 0}
+    status["total_uploads"] = conn.execute("SELECT COUNT(*) FROM uploads").fetchone()[0]
+    return status
+
+
+def summary_active(conn):
+    return _summary_status_value(conn) == SUMMARY_ACTIVE
+
+
+def _apply_summary_deltas(conn, crate_deltas, session_deltas):
+    """把（果园, 去向）箱数增量与果园仓次数增量并入汇总表（调用方负责事务）。"""
+    conn.executemany(
+        """
+        INSERT INTO crate_summary (orchard, destination, crates) VALUES (?, ?, ?)
+        ON CONFLICT (orchard, destination) DO UPDATE SET crates = crates + excluded.crates
+        """,
+        [(orchard, dest, crates) for (orchard, dest), crates in sorted(crate_deltas.items())],
+    )
+    conn.executemany(
+        """
+        INSERT INTO orchard_summary (orchard, sessions) VALUES (?, ?)
+        ON CONFLICT (orchard) DO UPDATE SET sessions = sessions + excluded.sessions
+        """,
+        sorted(session_deltas.items()),
+    )
+
+
+def apply_batch_to_summary(conn, batch, session_orchard):
+    """单个批次的汇总增量（入账事务内调用，与批次一起提交/回滚）。"""
+    crate_deltas = defaultdict(int)
+    delivery_sessions = defaultdict(set)  # 果园 -> 有交货/余箱记录的仓次
+    for d in batch.deliveries:
+        orchard = session_orchard.get(d["session"])
+        if orchard is None:
+            # 交货仓次必有所属果园（收发平衡校验已排除无果园分量），防御性跳过
+            continue
+        crate_deltas[(orchard, d["destination"])] += d["crates"]
+        delivery_sessions[orchard].add(d["session"])
+    session_deltas = {o: len(ss) for o, ss in delivery_sessions.items()}
+    _apply_summary_deltas(conn, crate_deltas, session_deltas)
+
+
+def _apply_uploads_to_summary(conn, upload_ids):
+    """把一批 upload（按 id 连续的一段）的箱数并入汇总表（调用方负责事务）。"""
+    marks = ", ".join("?" for _ in upload_ids)
+    crate_deltas = {}
+    rows = conn.execute(
+        f"""
+        SELECT s.orchard AS orchard, d.destination AS destination, SUM(d.crates) AS crates
+        FROM deliveries d JOIN sessions s ON s.name = d.session
+        WHERE d.upload_id IN ({marks})
+        GROUP BY s.orchard, d.destination
+        """,
+        upload_ids,
+    ).fetchall()
+    for r in rows:
+        crate_deltas[(r["orchard"], r["destination"])] = r["crates"]
+    session_deltas = {}
+    rows = conn.execute(
+        f"""
+        SELECT s.orchard AS orchard, COUNT(DISTINCT d.session) AS sessions
+        FROM deliveries d JOIN sessions s ON s.name = d.session
+        WHERE d.upload_id IN ({marks})
+        GROUP BY s.orchard
+        """,
+        upload_ids,
+    ).fetchall()
+    for r in rows:
+        session_deltas[r["orchard"]] = r["sessions"]
+    _apply_summary_deltas(conn, crate_deltas, session_deltas)
+
+
+def build_summary_chunk(conn, token, chunk_size):
+    """构建线程的一个分块：把 high_water_mark 之后的至多 chunk_size 批并入汇总表。
+
+    整个分块（增量 + 水位推进 + 心跳）在一个事务内提交，中断后重试从水位继续，
+    不会重复计数。conn 须为自动提交模式（isolation_level=None）。
+
+    返回 (处理批数, 新水位)；构建权已被接管（令牌不符）时返回 None。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        state = conn.execute(
+            "SELECT status, builder_token, high_water_mark FROM summary_state WHERE id = 1"
+        ).fetchone()
+        if state["status"] != SUMMARY_BUILDING or state["builder_token"] != token:
+            conn.execute("ROLLBACK")
+            return None
+        hwm = state["high_water_mark"]
+        ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM uploads WHERE id > ? ORDER BY id LIMIT ?", (hwm, chunk_size)
+            ).fetchall()
+        ]
+        if ids:
+            _apply_uploads_to_summary(conn, ids)
+            hwm = ids[-1]
+        conn.execute(
+            "UPDATE summary_state SET high_water_mark = ?, heartbeat_at = ? WHERE id = 1",
+            (hwm, time.time()),
+        )
+        conn.execute("COMMIT")
+        return len(ids), hwm
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def finalize_summary_build(conn, token):
+    """收尾：确认没有漏网的已入账批次后启用汇总。
+
+    与入账写事务互斥（同一 SQLite 写锁）：启用前一刻入账的批次要么已被本函数看到
+    （继续扫描），要么在启用之后入账并由入账事务自己并入汇总。conn 为自动提交模式。
+
+    返回 True 已启用；False 扫描期间又有新批次入账，需继续扫描；None 构建权被接管。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        state = conn.execute(
+            "SELECT status, builder_token, high_water_mark FROM summary_state WHERE id = 1"
+        ).fetchone()
+        if state["status"] != SUMMARY_BUILDING or state["builder_token"] != token:
+            conn.execute("ROLLBACK")
+            return None
+        max_upload = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM uploads").fetchone()["m"]
+        if max_upload > state["high_water_mark"]:
+            conn.execute("ROLLBACK")
+            return False
+        conn.execute(
+            """
+            UPDATE summary_state
+               SET status = ?, finished_at = ?, builder_token = NULL, heartbeat_at = ?
+             WHERE id = 1
+            """,
+            (SUMMARY_ACTIVE, datetime.now(timezone.utc).isoformat(timespec="seconds"), time.time()),
+        )
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        conn.execute("ROLLBACK")
         raise
 
 
@@ -297,7 +483,23 @@ def existing_destinations(conn):
 
 
 def orchard_summaries(conn):
-    """各果园汇总：总箱数、去向数、仓次数。"""
+    """各果园汇总：总箱数、去向数、仓次数。汇总启用后只查汇总表，否则扫描明细。"""
+    if summary_active(conn):
+        rows = conn.execute(
+            """
+            SELECT o.orchard AS orchard,
+                   COALESCE(c.total_crates, 0) AS total_crates,
+                   COALESCE(c.destinations, 0) AS destinations,
+                   o.sessions AS sessions
+            FROM orchard_summary o
+            LEFT JOIN (
+                SELECT orchard, SUM(crates) AS total_crates, COUNT(*) AS destinations
+                FROM crate_summary GROUP BY orchard
+            ) c ON c.orchard = o.orchard
+            ORDER BY o.orchard
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
     rows = conn.execute(
         """
         SELECT s.orchard AS orchard,
@@ -314,17 +516,26 @@ def orchard_summaries(conn):
 
 
 def orchard_entries(conn, orchard):
-    """某果园按去向的箱数汇总 —— 核对包的全部内容，条目数只随去向数量变化。"""
-    rows = conn.execute(
-        """
-        SELECT d.destination AS destination, SUM(d.crates) AS crates
-        FROM deliveries d JOIN sessions s ON d.session = s.name
-        WHERE s.orchard = ?
-        GROUP BY d.destination
-        ORDER BY d.destination
-        """,
-        (orchard,),
-    ).fetchall()
+    """某果园按去向的箱数汇总 —— 核对包的全部内容，条目数只随去向数量变化。
+
+    汇总启用后只查汇总表，否则扫描明细；两种路径的结果一致。
+    """
+    if summary_active(conn):
+        rows = conn.execute(
+            "SELECT destination, crates FROM crate_summary WHERE orchard = ? ORDER BY destination",
+            (orchard,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT d.destination AS destination, SUM(d.crates) AS crates
+            FROM deliveries d JOIN sessions s ON d.session = s.name
+            WHERE s.orchard = ?
+            GROUP BY d.destination
+            ORDER BY d.destination
+            """,
+            (orchard,),
+        ).fetchall()
     return [{"destination": r["destination"], "crates": r["crates"]} for r in rows]
 
 

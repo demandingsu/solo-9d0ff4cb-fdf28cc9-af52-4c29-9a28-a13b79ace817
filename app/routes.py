@@ -1,5 +1,6 @@
-"""页面路由：上传台账、下载核对包、市场核对。"""
+"""页面路由：上传台账、下载核对包、市场核对、箱数汇总构建。"""
 import json
+import time
 from datetime import datetime, timezone
 
 from flask import (
@@ -13,7 +14,7 @@ from flask import (
     url_for,
 )
 
-from . import checker, ledger
+from . import builder, checker, ledger
 from .db import get_db
 
 bp = Blueprint("main", __name__)
@@ -86,7 +87,26 @@ def packages():
     summaries = ledger.orchard_summaries(conn)
     for s in summaries:
         s["entries"] = ledger.orchard_entries(conn, s["orchard"])
-    return render_template("packages.html", orchards=summaries)
+    summary = ledger.summary_status(conn)
+    # 心跳超时视为构建中断：页面提示可按原账出包并重试
+    summary["stale"] = summary["status"] == ledger.SUMMARY_BUILDING and (
+        summary.get("heartbeat_at") is None
+        or summary["heartbeat_at"] < time.time() - current_app.config["SUMMARY_BUILD_STALE_SECONDS"]
+    )
+    return render_template("packages.html", orchards=summaries, summary=summary)
+
+
+@bp.post("/packages/summary/build")
+def build_summary():
+    """库管在核对包页发起（或重试）首次箱数汇总；后台分块构建，不阻塞入账与下载。"""
+    started, status = builder.request_build(current_app._get_current_object())
+    if started:
+        flash("已发起箱数汇总：后台分块扫描旧账，期间入账与下载不受影响；本页每 3 秒自动刷新进度。", "ok")
+    elif status == ledger.SUMMARY_ACTIVE:
+        flash("箱数汇总已启用，无需重复构建。", "ok")
+    else:
+        flash("汇总正在构建中，请稍候；若进度长时间不动，可稍后再试接管构建。", "ok")
+    return redirect(url_for("main.packages"))
 
 
 @bp.get("/packages/<path:orchard>/download")

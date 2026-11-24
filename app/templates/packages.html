@@ -1,7 +1,38 @@
 {% extends "base.html" %}
+{% block head_extra %}
+{% if summary.status == 'building' and not summary.stale %}
+<meta http-equiv="refresh" content="3">
+{% endif %}
+{% endblock %}
 {% block content %}
 <h2>核对包</h2>
 <p>核对包只含果园各去向的箱数汇总（条目数只随去向数量变化），并带签名防篡改。</p>
+
+<section class="card">
+  <h3>箱数汇总</h3>
+  {% if summary.status == 'active' %}
+  <p>汇总已启用（覆盖至第 {{ summary.high_water_mark }} 批，{{ summary.finished_at }} 完成）。
+     本页与下载的箱数直接读取汇总表，不再扫描台账明细；新入账批次会在入账时同步并入汇总。</p>
+  {% elif summary.status == 'building' %}
+  <p>汇总构建中：已扫描 {{ summary.high_water_mark }} / {{ summary.total_uploads }} 批。
+     构建期间本页与下载仍按原账出包，入账不受影响。</p>
+  {% if summary.stale %}
+  <p class="flash error">构建心跳已超时，构建可能已中断。已汇总的进度会保留，可重试继续。</p>
+  <form method="post" action="{{ url_for('main.build_summary') }}">
+    <button type="submit">重试构建（从第 {{ summary.high_water_mark }} 批继续）</button>
+  </form>
+  {% else %}
+  <p>本页每 3 秒自动刷新进度。</p>
+  {% endif %}
+  {% else %}
+  <p>尚未建立箱数汇总：台账较厚时本页打开会变慢。库管可在此发起首次汇总，
+     后台分块扫描旧账，期间其他人仍可正常入账与下载。</p>
+  <form method="post" action="{{ url_for('main.build_summary') }}">
+    <button type="submit">发起首次箱数汇总</button>
+  </form>
+  {% endif %}
+</section>
+
 {% if orchards %}
   {% for o in orchards %}
   <section class="card">
