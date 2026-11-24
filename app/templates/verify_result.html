@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>核对结果 · {{ package.orchard }}</h2>
+
+{% if verdict.ok %}
+<div class="verdict ok">相符：整组报数可以由同一套符合原账的产地流向解释。</div>
+{% elif verdict.reason == "total_difference" %}
+<div class="verdict bad">
+  不符：报数合计 {{ verdict.total_reported }} 箱，账面合计 {{ verdict.total_ledger }} 箱，
+  总数差额 {% if verdict.difference > 0 %}+{% endif %}{{ verdict.difference }} 箱。
+</div>
+{% elif verdict.reason == "over_limit" %}
+<div class="verdict bad">
+  不符：以下去向组合超限，无法由同一套符合原账的产地流向解释。
+</div>
+<table>
+  <tr><th>超限去向</th><th>报数</th><th>账面</th><th>超出</th></tr>
+  {% for o in verdict.over_limit %}
+  <tr><td>{{ o.destination }}</td><td>{{ o.reported }}</td><td>{{ o.ledger }}</td><td>+{{ o.excess }}</td></tr>
+  {% endfor %}
+</table>
+{% if verdict.deficits %}
+<p>相应报少的去向：</p>
+<table>
+  <tr><th>去向</th><th>报数</th><th>账面</th><th>差额</th></tr>
+  {% for d in verdict.deficits %}
+  <tr><td>{{ d.destination }}</td><td>{{ d.reported }}</td><td>{{ d.ledger }}</td><td>-{{ d.shortage }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endif %}
+
+<h3>全量对照</h3>
+<table>
+  <tr><th>去向</th><th>账面箱数</th><th>报数</th></tr>
+  {% for r in verdict.rows %}
+  <tr class="{% if r.reported != r.ledger %}mismatch{% endif %}">
+    <td>{{ r.destination }}</td><td>{{ r.ledger }}</td><td>{{ r.reported }}</td>
+  </tr>
+  {% endfor %}
+  <tr class="total"><td>合计</td><td>{{ verdict.total_ledger }}</td><td>{{ verdict.total_reported }}</td></tr>
+</table>
+<p><a href="{{ url_for('main.verify') }}">再核对一份</a></p>
+{% endblock %}

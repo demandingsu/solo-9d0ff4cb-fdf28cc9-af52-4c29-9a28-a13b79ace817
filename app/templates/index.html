@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>台账总览</h2>
+<table>
+  <tr><th>已入账批次</th><th>仓次数</th><th>果园数</th><th>去向数（上限 {{ max_destinations if max_destinations is defined else 4 }}）</th></tr>
+  <tr>
+    <td>{{ overview.uploads }}</td>
+    <td>{{ overview.sessions }}</td>
+    <td>{{ overview.orchards }}</td>
+    <td>{{ overview.destinations }}{% if destinations %}（{{ destinations|join('、') }}）{% endif %}</td>
+  </tr>
+</table>
+
+<h2>各果园汇总</h2>
+{% if orchards %}
+<table>
+  <tr><th>果园</th><th>总箱数</th><th>去向数</th><th>仓次数</th><th></th></tr>
+  {% for o in orchards %}
+  <tr>
+    <td>{{ o.orchard }}</td>
+    <td>{{ o.total_crates }}</td>
+    <td>{{ o.destinations }}</td>
+    <td>{{ o.sessions }}</td>
+    <td><a href="{{ url_for('main.download_package', orchard=o.orchard) }}">下载核对包</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p>台账为空，请先<a href="{{ url_for('main.upload') }}">上传一批已结清的 CSV</a>。</p>
+{% endif %}
+{% endblock %}

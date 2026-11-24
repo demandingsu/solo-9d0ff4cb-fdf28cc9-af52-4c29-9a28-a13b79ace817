@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>核对包</h2>
+<p>核对包只含果园各去向的箱数汇总（条目数只随去向数量变化），并带签名防篡改。</p>
+{% if orchards %}
+  {% for o in orchards %}
+  <section class="card">
+    <h3>{{ o.orchard }}</h3>
+    {% if o.entries %}
+    <table>
+      <tr><th>去向</th><th>箱数</th></tr>
+      {% for e in o.entries %}
+      <tr><td>{{ e.destination }}</td><td>{{ e.crates }}</td></tr>
+      {% endfor %}
+      <tr class="total"><td>合计</td><td>{{ o.total_crates }}</td></tr>
+    </table>
+    <p><a class="button" href="{{ url_for('main.download_package', orchard=o.orchard) }}">下载核对包（JSON）</a></p>
+    {% else %}
+    <p>该果园暂无交货/余箱记录，无法生成核对包。</p>
+    {% endif %}
+  </section>
+  {% endfor %}
+{% else %}
+<p>台账为空，还没有可下载的核对包。</p>
+{% endif %}
+{% endblock %}

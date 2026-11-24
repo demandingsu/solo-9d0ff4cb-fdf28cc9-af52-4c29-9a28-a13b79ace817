@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>上传一批已结清台账</h2>
+<p>三个 CSV 一起上传，按整箱记数。任一仓次收发有差额、去向超过 {{ max_destinations }} 个、
+仓次跨果园或批次重复，都会指出问题并退回本次上传（不入账）。</p>
+
+<form method="post" enctype="multipart/form-data" class="upload-form">
+  <label>入库 CSV（表头：{{ inbound_headers }}）
+    <input type="file" name="inbound" accept=".csv" required>
+  </label>
+  <label>转仓 CSV（表头：{{ transfer_headers }}）
+    <input type="file" name="transfers" accept=".csv" required>
+  </label>
+  <label>交货 CSV（表头：{{ delivery_headers }}；类型为 交货 或 余箱）
+    <input type="file" name="deliveries" accept=".csv" required>
+  </label>
+  <button type="submit">校验并入账</button>
+</form>
+
+<h3>校验规则</h3>
+<ul>
+  <li>箱数一律为正整数（整箱）。</li>
+  <li>入库注明果园；同一仓次只能归属一个果园，转仓只能在同果园仓次间进行。</li>
+  <li>每个仓次：入库 + 转入 = 转出 + 交货 + 余箱，有差额则指出仓次并整批退回。</li>
+  <li>交货和余箱合计最多 {{ max_destinations }} 个去向。</li>
+  <li>仓次名全库唯一；同一批文件重复上传会被拒收。</li>
+</ul>
+{% endblock %}

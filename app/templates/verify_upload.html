@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>市场核对 · 第一步：上传核对包</h2>
+<p>网页仅凭核对包和各去向报数，判断整组数字能否由同一套符合原账的产地流向解释。</p>
+<form method="post" enctype="multipart/form-data" class="upload-form">
+  <label>核对包（JSON）
+    <input type="file" name="package" accept=".json,application/json" required>
+  </label>
+  <button type="submit">读取核对包</button>
+</form>
+{% endblock %}

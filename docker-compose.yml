@@ -1,0 +1,20 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # 生产部署务必改成随机长串：APP_SECRET_KEY=xxx docker compose up
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-please-change-me-in-production}
+      LEDGER_DB: /data/ledger.db
+    volumes:
+      - ledger-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  ledger-data:

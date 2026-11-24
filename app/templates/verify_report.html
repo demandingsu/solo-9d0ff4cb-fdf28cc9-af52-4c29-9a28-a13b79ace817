@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>市场核对 · 第二步：填报各去向报数</h2>
+<p>果园：<strong>{{ package.orchard }}</strong>（核对包生成于 {{ package.generated_at }}，签名校验通过）。
+请按市场实际记录填写每个去向的箱数（整箱）。</p>
+<form method="post" action="{{ url_for('main.verify_check') }}">
+  <input type="hidden" name="package" value='{{ package_json }}'>
+  <table>
+    <tr><th>去向</th><th>报数（箱）</th></tr>
+    {% for e in package.entries %}
+    <tr>
+      <td>{{ e.destination }}<input type="hidden" name="destination" value="{{ e.destination }}"></td>
+      <td><input type="number" name="report" min="0" step="1" required></td>
+    </tr>
+    {% endfor %}
+  </table>
+  <button type="submit">提交核对</button>
+</form>
+{% endblock %}
